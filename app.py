@@ -2,6 +2,8 @@
 import argparse
 from pathlib import Path
 
+from src.airrules import AirRules
+from src.airservice import AirService
 from src.audit import AuditRecorder
 from src.http_api import create_server
 from src.repository import Repository
@@ -20,8 +22,13 @@ def build_service(db_path: str) -> Service:
     return Service(repository, DomainRules(), audit)
 
 
+def build_air_service(db_path: str) -> AirService:
+    repository = Repository(db_path)
+    return AirService(repository, AirRules())
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="急救车调度与目的地分流")
+    parser = argparse.ArgumentParser(description="急救车调度与空地转运分流")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite数据库路径")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP监听端口")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址")
@@ -32,8 +39,9 @@ def main() -> None:
     args = parse_args()
     Path(args.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     service = build_service(args.db)
-    server = create_server(args.host, args.port, service, BASE_DIR / "static")
-    print("急救车调度与目的地分流 listening on http://%s:%s" % (args.host, args.port), flush=True)
+    air_service = build_air_service(args.db)
+    server = create_server(args.host, args.port, service, BASE_DIR / "static", air_service=air_service)
+    print("急救车调度与空地转运分流 listening on http://%s:%s" % (args.host, args.port), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
