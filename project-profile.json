@@ -6,6 +6,6 @@
   "projectForm": "完整项目",
   "codeScope": "backend, frontend",
   "languages": ["Python", "HTML", "CSS", "JavaScript"],
-  "summary": "急救车调度与目的地分流服务，覆盖优先级评分、能力匹配、车辆冲突和权限审计。",
+  "summary": "空地转运台：急救车调度与直升机分流，覆盖天气/航程/载重/机位/医院余量派单核对、起飞锁定、改降释放床位与伤员时间线。",
   "containerized": false
 }

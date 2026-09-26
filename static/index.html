@@ -3,31 +3,96 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>急救车调度与目的地分流</title>
+  <title>空地转运台</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
-    button { padding: .55rem .9rem; cursor: pointer; }
+    main { max-width: 1080px; margin: auto; }
+    button { padding: .5rem .85rem; cursor: pointer; }
     pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin-bottom: .5rem; }
+    h2 { margin-top: 2rem; font-size: 1.1rem; }
   </style>
 </head>
 <body>
 <main>
-  <h1>急救车调度与目的地分流</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
-  <pre id="output">点击上方按钮读取服务状态。</pre>
+  <h1>空地转运台</h1>
+  <p>山区公路中断场景：伤员 / 直升机 / 医院登记，派单核对天气、往返里程、载重、机位与医院余量；不满足留候派区并写明缺口。最小演示页，完整流程见 README 接口。</p>
+
+  <h2>资源总览</h2>
+  <div class="row">
+    <button id="waiting">候派区伤员</button>
+    <button id="crafts">直升机与机位</button>
+    <button id="hospitals">医院余量</button>
+    <button id="stats">状态总览</button>
+  </div>
+
+  <h2>端到端演示（新建数据，自动跑完整流程）</h2>
+  <div class="row">
+    <button id="demo">运行空地转运演示</button>
+  </div>
+  <pre id="output">点击上方按钮开始。</pre>
 </main>
 <script>
-const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
+const headers = {"Content-Type":"application/json","X-User-Id":"demo-admin","X-Role":"admin","X-Org":"rescue"};
+async function req(method, path, body) {
+  const response = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : undefined});
   const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+  if (!response.ok) throw {status: response.status, data};
+  return data;
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+function show(label, data) {
+  document.getElementById("output").textContent = "### " + label + "\n" + JSON.stringify(data, null, 2);
+}
+document.getElementById("waiting").onclick = async () =>
+  show("候派区伤员", (await req("GET", "/api/air/patients?state=waiting")).items);
+document.getElementById("crafts").onclick = async () =>
+  show("直升机与机位", (await req("GET", "/api/air/helicopters")).items);
+document.getElementById("hospitals").onclick = async () =>
+  show("医院余量", (await req("GET", "/api/air/hospitals")).items);
+document.getElementById("stats").onclick = async () => show("状态总览", await req("GET", "/api/air/stats"));
+
+document.getElementById("demo").onclick = async () => {
+  const log = [];
+  const tag = Date.now().toString().slice(-6);
+  try {
+    const patient = await req("POST", "/api/air/patients", {code:"CAS-"+tag, data:{
+      name:"山民甲", injury_level:"critical", weight_kg:78, oxygen_required:true, oxygen_lpm:10, pickup_location:"K32塌方点"}});
+    const craft = await req("POST", "/api/air/helicopters", {code:"HELI-"+tag, data:{
+      base:"县体育公园起降点", range_km:260, payload_capacity_kg:550, seats:1, night_qualified:true}});
+    const hospital = await req("POST", "/api/air/hospitals", {code:"HOSP-"+tag, data:{
+      name:"市人民医院", total_slots:3, oxygen_available:true}});
+    const backup = await req("POST", "/api/air/hospitals", {code:"HOSPB-"+tag, data:{
+      name:"矿务局医院", total_slots:4, oxygen_available:true}});
+    log.push(["登记完成", {patient: patient.code, craft: craft.code, hospital: hospital.code}]);
+
+    const check = {helicopter_id: craft.id, hospital_id: hospital.id,
+      night_flight:false, weather_ok:true, weather_phone_confirmed:true, beds_phone_confirmed:true,
+      outbound_km:60, return_km:70, crew_kg:160, equipment_kg:30};
+    const dispatched = await req("POST", `/api/air/patients/${patient.id}/dispatch`, {data: check});
+    log.push(["派单核对", {passed: dispatched.passed, metrics: dispatched.metrics}]);
+
+    const airborne = await req("POST", `/api/air/patients/${patient.id}/actions/takeoff`,
+      {expected_version: dispatched.patient.version, data:{takeoff_confirmed:true}});
+    log.push(["起飞（整机锁定）", {state: airborne.state}]);
+
+    const diverted = await req("POST", `/api/air/patients/${patient.id}/divert`,
+      {expected_version: airborne.version, data:{target_hospital_id: backup.id, note:"市人民医院临时停氧"}});
+    log.push(["改降（先释放原床位）", {
+      to: diverted.patient.payload.hospital_name,
+      original_remaining: diverted.from_hospital.remaining_slots,
+      target_remaining: diverted.to_hospital.remaining_slots}]);
+
+    const handed = await req("POST", `/api/air/patients/${patient.id}/actions/handover`,
+      {expected_version: diverted.patient.version, data:{handover_accepted:true}});
+    log.push(["交接完成", {patient: handed.patient.state, helicopter: handed.helicopter.state}]);
+
+    const timeline = await req("GET", `/api/air/patients/${patient.id}/timeline`);
+    log.push(["伤员时间线", timeline.items.map(e => e.action)]);
+    show("空地转运演示完成", log);
+  } catch (err) {
+    show("演示中断", err);
+  }
+};
 </script>
 </body>
 </html>

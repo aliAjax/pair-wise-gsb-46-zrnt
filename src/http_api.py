@@ -13,8 +13,15 @@ RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
 
+AIR_ITEM_RE = re.compile(r"^/api/air/(patients|helicopters|hospitals)/(\d+)$")
+AIR_TIMELINE_RE = re.compile(r"^/api/air/patients/(\d+)/timeline$")
+AIR_DISPATCH_RE = re.compile(r"^/api/air/patients/(\d+)/dispatch$")
+AIR_ACTION_RE = re.compile(r"^/api/air/patients/(\d+)/actions/(takeoff|handover|cancel)$")
+AIR_DIVERT_RE = re.compile(r"^/api/air/patients/(\d+)/divert$")
+AIR_COLLECTIONS = {"patients": "patient", "helicopters": "helicopter", "hospitals": "hospital"}
 
-def make_handler(service: Any, static_dir: Path):
+
+def make_handler(service: Any, static_dir: Path, air_service: Any = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "ambulance-dispatch/1.0"
 
@@ -87,9 +94,47 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
+                if air_service is not None:
+                    if self._air_get(parsed):
+                        return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
+
+        def _air_get(self, parsed) -> bool:
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            if path == "/api/air/stats":
+                self._send(200, air_service.overview(self._actor()))
+                return True
+            match = AIR_TIMELINE_RE.match(path)
+            if match:
+                self._send(200, {"items": air_service.patient_timeline(self._actor(), int(match.group(1)))})
+                return True
+            match = AIR_ITEM_RE.match(path)
+            if match:
+                kind, entity_id = match.group(1), int(match.group(2))
+                if kind == "patients":
+                    result = air_service.get_patient(self._actor(), entity_id)
+                elif kind == "helicopters":
+                    result = air_service.get_helicopter(self._actor(), entity_id)
+                else:
+                    result = air_service.get_hospital(self._actor(), entity_id)
+                self._send(200, result)
+                return True
+            if path in {"/api/air/patients", "/api/air/helicopters", "/api/air/hospitals"}:
+                kind = AIR_COLLECTIONS[path.rsplit("/", 1)[-1]]
+                state = query.get("state", [None])[0]
+                limit = int(query.get("limit", ["100"])[0])
+                if kind == "patient":
+                    items = air_service.list_patients(self._actor(), state=state, limit=limit)
+                elif kind == "helicopter":
+                    items = air_service.list_helicopters(self._actor(), state=state, limit=limit)
+                else:
+                    items = air_service.list_hospitals(self._actor(), limit=limit)
+                self._send(200, {"items": items})
+                return True
+            return False
 
         def do_POST(self) -> None:
             try:
@@ -107,12 +152,64 @@ def make_handler(service: Any, static_dir: Path):
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
                     return
+                if air_service is not None and self._air_post(parsed.path, body):
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
 
+        def _air_post(self, path: str, body: Dict[str, Any]) -> bool:
+            actor = self._actor()
+            match = AIR_DISPATCH_RE.match(path)
+            if match:
+                data = body.get("data", {})
+                helicopter_id = data.get("helicopter_id")
+                hospital_id = data.get("hospital_id")
+                if not isinstance(helicopter_id, int) or not isinstance(hospital_id, int):
+                    raise ValidationError("helicopter_id与hospital_id必须是整数")
+                result = air_service.evaluate_dispatch(actor, int(match.group(1)), helicopter_id, hospital_id, data)
+                self._send(200, result)
+                return True
+            match = AIR_ACTION_RE.match(path)
+            if match:
+                version = body.get("expected_version")
+                if not isinstance(version, int):
+                    raise ValidationError("expected_version必须是整数")
+                patient_id, action = int(match.group(1)), match.group(2)
+                if action == "takeoff":
+                    result = air_service.takeoff(actor, patient_id, version, body.get("data", {}))
+                elif action == "handover":
+                    result = air_service.handover(actor, patient_id, version, body.get("data", {}))
+                else:
+                    result = air_service.cancel(actor, patient_id, version, body.get("data", {}))
+                self._send(200, result)
+                return True
+            match = AIR_DIVERT_RE.match(path)
+            if match:
+                version = body.get("expected_version")
+                if not isinstance(version, int):
+                    raise ValidationError("expected_version必须是整数")
+                data = body.get("data", {})
+                target = data.get("target_hospital_id")
+                if not isinstance(target, int):
+                    raise ValidationError("target_hospital_id必须是整数")
+                result = air_service.divert(actor, int(match.group(1)), version, target, data.get("note", ""))
+                self._send(200, result)
+                return True
+            if path in {"/api/air/patients", "/api/air/helicopters", "/api/air/hospitals"}:
+                kind = AIR_COLLECTIONS[path.rsplit("/", 1)[-1]]
+                if kind == "patient":
+                    result = air_service.register_patient(actor, body.get("code", ""), body.get("data", {}))
+                elif kind == "helicopter":
+                    result = air_service.register_helicopter(actor, body.get("code", ""), body.get("data", {}))
+                else:
+                    result = air_service.register_hospital(actor, body.get("code", ""), body.get("data", {}))
+                self._send(201, result)
+                return True
+            return False
+
     return Handler
 
 
-def create_server(host: str, port: int, service: Any, static_dir: Path) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(service, static_dir))
+def create_server(host: str, port: int, service: Any, static_dir: Path, air_service: Any = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(service, static_dir, air_service))
